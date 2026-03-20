@@ -151,7 +151,7 @@ class SWEBenchProStrategy(DockerStrategy):
             "cwd": cwd,
             "timeout": 120,  # 2 minutes for commands
             "pull_timeout": 600,  # 10 minutes for large images
-            "run_args": ["--rm", "--platform", "linux/amd64"],
+            "run_args": ["--rm"],
         }
     
     def get_environment_config(self, instance: dict, docker_config: dict) -> dict:
@@ -160,7 +160,7 @@ class SWEBenchProStrategy(DockerStrategy):
             "cwd": docker_config.get("cwd", "/app"),
             "timeout": docker_config.get("timeout", 120),
             "pull_timeout": docker_config.get("pull_timeout", 600),
-            "run_args": docker_config.get("run_args", ["--rm", "--platform", "linux/amd64"]),
+            "run_args": docker_config.get("run_args", ["--rm"]),
         }
 
 
@@ -197,7 +197,7 @@ class MultiSWEBenchStrategy(DockerStrategy):
             "cwd": cwd,
             "timeout": 600,  # 10 minutes for complex builds (increased for large repos like MUI)
             "pull_timeout": 600,  # 10 minutes
-            "run_args": ["--rm", "--platform", "linux/amd64"],
+            "run_args": ["--rm"],
         }
     
     def get_environment_config(self, instance: dict, docker_config: dict) -> dict:
@@ -206,7 +206,7 @@ class MultiSWEBenchStrategy(DockerStrategy):
             "cwd": docker_config.get("cwd", "/home"),
             "timeout": docker_config.get("timeout", 600),  # Default 10 minutes for large repos
             "pull_timeout": docker_config.get("pull_timeout", 600),
-            "run_args": docker_config.get("run_args", ["--rm", "--platform", "linux/amd64"]),
+            "run_args": docker_config.get("run_args", ["--rm"]),
         }
 
 
@@ -231,7 +231,7 @@ class PolyBenchStrategy(DockerStrategy):
                 "cwd": cwd,
                 "timeout": 120,
                 "pull_timeout": 600,
-                "run_args": ["--rm", "--platform", "linux/amd64"],
+                "run_args": ["--rm"],
             }
         
         # Try Priority 2: Extract Dockerfile from poly data
@@ -247,7 +247,7 @@ class PolyBenchStrategy(DockerStrategy):
                     "cwd": "/testbed",
                     "timeout": 120,
                     "pull_timeout": 600,
-                    "run_args": ["--rm", "--platform", "linux/amd64"],
+                    "run_args": ["--rm"],
                 }
         
         raise RuntimeError(
@@ -262,7 +262,7 @@ class PolyBenchStrategy(DockerStrategy):
                 "cwd": docker_config.get("cwd", "/testbed"),
                 "timeout": docker_config.get("timeout", 120),
                 "pull_timeout": docker_config.get("pull_timeout", 600),
-                "run_args": docker_config.get("run_args", ["--rm", "--platform", "linux/amd64"]),
+                "run_args": docker_config.get("run_args", ["--rm"]),
             }
         elif docker_config.get("dockerfile_content"):
             # Will be handled by build logic in get_sb_environment_with_docker_config
@@ -270,7 +270,7 @@ class PolyBenchStrategy(DockerStrategy):
                 "cwd": docker_config.get("cwd", "/testbed"),
                 "timeout": docker_config.get("timeout", 120),
                 "pull_timeout": docker_config.get("pull_timeout", 600),
-                "run_args": docker_config.get("run_args", ["--rm", "--platform", "linux/amd64"]),
+                "run_args": docker_config.get("run_args", ["--rm"]),
             }
         else:
             raise RuntimeError("PolyBench strategy: no base_image or dockerfile_content available")
@@ -296,7 +296,7 @@ class SWEBenchDefaultStrategy(DockerStrategy):
             "cwd": cwd,
             "timeout": 120,
             "pull_timeout": 600,
-            "run_args": ["--rm", "--platform", "linux/amd64"],
+            "run_args": ["--rm"],
         }
     
     def get_environment_config(self, instance: dict, docker_config: dict) -> dict:
@@ -305,7 +305,7 @@ class SWEBenchDefaultStrategy(DockerStrategy):
             "cwd": docker_config.get("cwd", "/testbed"),
             "timeout": docker_config.get("timeout", 120),
             "pull_timeout": docker_config.get("pull_timeout", 600),
-            "run_args": docker_config.get("run_args", ["--rm", "--platform", "linux/amd64"]),
+            "run_args": docker_config.get("run_args", ["--rm"]),
         }
 
 
@@ -431,7 +431,7 @@ class DockerConfigExtractor:
             try:
                 logger.info(f"⬇️  Pulling Docker image: {image_uri} (timeout: {pull_timeout}s)")
                 # Use longer timeout for large images
-                client.images.pull(image_uri, platform="linux/amd64")
+                client.images.pull(image_uri)
                 logger.info(f"✓ Successfully pulled: {image_uri}")
                 return True
             except Exception as pull_err:
@@ -761,7 +761,6 @@ def _check_directory_exists_in_image(image_name: str, directory: str) -> bool:
     try:
         result = subprocess.run([
             "docker", "run", "--rm", "--entrypoint", "/bin/sh",
-            "--platform", "linux/amd64", 
             image_name, "-c", f"test -d {directory} && echo exists"
         ], capture_output=True, text=True, timeout=60)
         
@@ -809,8 +808,8 @@ def get_sb_environment_with_docker_config(config: dict, instance: dict, docker_c
             
             logger.info(f"Building temporary Docker image: {temp_image_name}")
             build_result = subprocess.run([
-                "docker", "build", "-f", temp_dockerfile_path, 
-                "-t", temp_image_name, ".", "--platform", "linux/amd64"
+                "docker", "build", "-f", temp_dockerfile_path,
+                "-t", temp_image_name, "."
             ], cwd="/tmp", capture_output=True, text=True, timeout=1800)
             
             if build_result.returncode == 0:
