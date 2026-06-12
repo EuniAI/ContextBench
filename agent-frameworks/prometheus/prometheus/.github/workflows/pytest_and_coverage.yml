@@ -1,0 +1,97 @@
+name: pytest and coverage
+permissions:
+  contents: write
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      # Logging
+      PROMETHEUS_LOGGING_LEVEL: DEBUG
+
+      # General settings
+      PROMETHEUS_ENVIRONMENT: local
+      PROMETHEUS_BACKEND_CORS_ORIGINS: "[\"*\"]"
+      PROMETHEUS_ENABLE_AUTHENTICATION: false
+
+      # Neo4j settings
+      PROMETHEUS_NEO4J_URI: bolt://localhost:7687
+      PROMETHEUS_NEO4J_USERNAME: neo4j
+      PROMETHEUS_NEO4J_PASSWORD: password
+      PROMETHEUS_NEO4J_BATCH_SIZE: 1000
+
+      # Knowledge Graph settings
+      PROMETHEUS_WORKING_DIRECTORY: /tmp/
+      PROMETHEUS_KNOWLEDGE_GRAPH_MAX_AST_DEPTH: 3
+      PROMETHEUS_KNOWLEDGE_GRAPH_CHUNK_SIZE: 10000
+      PROMETHEUS_KNOWLEDGE_GRAPH_CHUNK_OVERLAP: 1000
+
+      # LLM API keys and model settings
+      PROMETHEUS_ADVANCED_MODEL: gpt-4o
+      PROMETHEUS_BASE_MODEL: gpt-4o
+
+      # API keys for various LLM providers
+      PROMETHEUS_ANTHROPIC_API_KEY: anthropic_api_key
+      PROMETHEUS_GEMINI_API_KEY: gemini_api_key
+      PROMETHEUS_OPENAI_FORMAT_API_KEY: openai_format_api_key
+      PROMETHEUS_OPENAI_FORMAT_BASE_URL: https://api.openai.com/v1/chat/completions
+
+      # Model settings
+      PROMETHEUS_ADVANCED_MODEL_TEMPERATURE: 0.3
+
+      PROMETHEUS_BASE_MODEL_TEMPERATURE: 0.3
+
+      # GitHub settings
+      PROMETHEUS_GITHUB_ACCESS_TOKEN: github_access_token
+
+      # Tavily API key
+      PROMETHEUS_TAVILY_API_KEY: tavily_api_key
+
+      # DATABASE settings
+      PROMETHEUS_DATABASE_URL: postgresql://postgres:password@localhost:5432/postgres?sslmode=disable
+
+      # JWT settings
+      PROMETHEUS_JWT_SECRET_KEY: your_jwt_secret_key
+
+      # Athena memory service settings
+      PROMETHEUS_ATHENA_BASE_URL: http://localhost:9003/v0.1.0
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install .
+          pip install .[test]
+
+      - name: Pytest
+        run: coverage run --source=prometheus -m pytest -v -s -m "not git"
+
+      - name: Test coverage
+        run: coverage report -m
+
+      - name: Creating coverage folder
+        run: mkdir -p coverage
+
+      - name: Generate coverage Badge
+        uses: tj-actions/coverage-badge-py@v1.8
+        with:
+          output: coverage/coverage.svg
+
+      - name: Publish coverage report to coverage-badge branch
+        uses: JamesIves/github-pages-deploy-action@v4
+        with:
+          branch: coverage-badge
+          folder: coverage

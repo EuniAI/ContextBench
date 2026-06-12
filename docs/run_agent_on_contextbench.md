@@ -20,6 +20,7 @@ For each instance, the script:
 |---------|----------------|-------------------|---------------------|--------------------|
 | agentless | run_bench.py   | run_bench.py      | run_bench.py        | run_bench.py       |
 | miniswe | swebench_context_aware | swebench_context_aware | swebench_context_aware | swebench_context_aware |
+| prometheus | run_bench.py (HTTP API) | run_bench.py | run_bench.py | run_bench.py |
 
 ## Command-Line Arguments
 
@@ -27,7 +28,7 @@ For each instance, the script:
 
 | Argument | Description |
 |----------|-------------|
-| `--agent` | Agent to use: `agentless`, `miniswe`, `sweagent`, or `openhands` |
+| `--agent` | Agent to use: `agentless`, `miniswe`, `sweagent`, `openhands`, or `prometheus` |
 
 ### Task Source
 
@@ -67,6 +68,16 @@ For each instance, the script:
 |----------|-------------|
 | `--openhands-model-config` | OpenHands LLM config name (or set `OPENHANDS_MODEL_CONFIG`) |
 | `--openhands-agent` | OpenHands Agent class name (or set `OPENHANDS_AGENT`) |
+
+### Prometheus Options
+
+| Argument | Description |
+|----------|-------------|
+| `--prometheus-url` | Prometheus API base URL (or set `PROMETHEUS_URL`; default `http://localhost:9002/v1.3`) |
+
+Prometheus LLM credentials are **not** passed through `contextbench.run`. Configure them in
+`agent-frameworks/prometheus/prometheus/.env` and restart the Prometheus container after changes.
+See [agent-frameworks/prometheus/README.md](../agent-frameworks/prometheus/README.md).
 
 ## Usage Examples
 
@@ -122,6 +133,21 @@ python -m contextbench.run --agent agentless \
     --dry-run
 ```
 
+### Prometheus
+
+```bash
+# Default local API (http://localhost:9002/v1.3)
+python -m contextbench.run --agent prometheus --bench Verified --limit 1
+
+# Custom API URL via CLI
+python -m contextbench.run --agent prometheus --bench Verified --limit 1 \
+    --prometheus-url http://localhost:9002/v1.3
+
+# Or via environment variable
+export PROMETHEUS_URL=http://localhost:9002/v1.3
+python -m contextbench.run --agent prometheus --bench Pro --limit 1
+```
+
 ## Prerequisites
 
 ### Agentless
@@ -148,6 +174,17 @@ python -m contextbench.run --agent agentless \
 - Model and Agent can be configured via `OPENHANDS_MODEL_CONFIG`, `OPENHANDS_AGENT`
 - Single-instance runs use `EVAL_LIMIT=1`; exact filtering requires a pre-configured `config.toml`
 
+### Prometheus
+
+- Entry point: `agent-frameworks/prometheus/run_bench.py` (calls Prometheus HTTP API)
+- Vendored service: `agent-frameworks/prometheus/prometheus/`
+- Start stack: `cd agent-frameworks/prometheus/prometheus && cp example.env .env && docker-compose up -d`
+- **LLM keys** (required for `/issue/answer/`): edit `prometheus/.env` (`PROMETHEUS_OPENAI_FORMAT_API_KEY`, `PROMETHEUS_OPENAI_FORMAT_BASE_URL`, model names). Restart after changes: `docker compose restart prometheus`
+- **API URL** (adapter → service): pass `--prometheus-url` to `contextbench.run`, or set `PROMETHEUS_URL`. LLM keys cannot be passed via the run script.
+- Optional adapter env vars: `PROMETHEUS_TIMEOUT`, `GITHUB_TOKEN`, `PROMETHEUS_JWT_TOKEN` (if authentication enabled)
+- Uses SWE-bench Docker images via `image_name` + `workdir` on `/issue/answer/`
+- Output: `prometheus/{bench}/{instance_id}.log` + `.json` (patch)
+
 ## Output Structure
 
 Trajectories are organized by agent and bench:
@@ -162,6 +199,13 @@ Trajectories are organized by agent and bench:
 │   └── Multi/
 └── miniswe/
     ├── Verified/
+    ├── Pro/
+    ├── Poly/
+    └── Multi/
+└── prometheus/
+    ├── Verified/
+    │   ├── {instance_id}.log
+    │   └── {instance_id}.json
     ├── Pro/
     ├── Poly/
     └── Multi/

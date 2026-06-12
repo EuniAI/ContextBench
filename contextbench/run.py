@@ -14,6 +14,7 @@ then call the agent framework that has been adapted for that bench.
 Prerequisites:
 - For agentless: Ensure data/ contains dataset splits (Verified, Pro, Poly, Multi) and
   run `python agent-frameworks/agentless/run_bench.py {bench} --instance ID` for single instances.
+- For prometheus: Start Prometheus (Neo4j + Postgres + API); set API URL via PROMETHEUS_URL or --prometheus-url; configure LLM keys in agent-frameworks/prometheus/prometheus/.env (not via this script). See agent-frameworks/prometheus/README.md
 - Each agent framework must have its own environment/dependencies installed.
 
 Usage:
@@ -31,6 +32,9 @@ Usage:
 
     # Dry run (list tasks only)
     python -m contextbench.run --agent miniswe --bench Verified --dry-run
+
+    # Run Prometheus (LLM keys in prometheus/.env; URL via --prometheus-url or PROMETHEUS_URL)
+    python -m contextbench.run --agent prometheus --bench Verified --limit 1 --prometheus-url http://localhost:9002/v1.3
 """
 
 from __future__ import annotations
@@ -91,6 +95,11 @@ def detect_bench_from_instance_id(instance_id: str, original_inst_id: str = "") 
 # ---------------------------------------------------------------------------
 
 
+def _clean_text(text: str) -> str:
+    """Remove null bytes and other non-printable control characters (except newline/tab)."""
+    return "".join(c for c in text if c.isprintable() or c in "\n\r\t")
+
+
 def _run_subprocess(
     cmd: List[str],
     *,
@@ -110,7 +119,7 @@ def _run_subprocess(
             timeout=timeout,
         )
         return subprocess.CompletedProcess(cmd, result.returncode, stdout="", stderr="")
-    return subprocess.run(
+    result = subprocess.run(
         cmd,
         cwd=cwd,
         env=env,
@@ -118,6 +127,10 @@ def _run_subprocess(
         capture_output=True,
         text=True,
     )
+    # Clean null bytes / non-printable chars from captured output to avoid log corruption
+    result.stdout = _clean_text(result.stdout)
+    result.stderr = _clean_text(result.stderr)
+    return result
 
 
 def _openhands_has_model_config(run_dir: Path, model_config: str) -> bool:
@@ -148,6 +161,16 @@ def _clear_previous_outputs(agent: str, bench: str, output_dir: Path, instance_i
     base = output_dir / agent / bench
     if not base.exists():
         return
+    if agent == "prometheus":
+        for inst in instance_ids:
+            if not inst:
+                continue
+            for path in base.glob(f"{inst}.*"):
+                if path.is_file():
+                    try:
+                        path.unlink()
+                    except FileNotFoundError:
+                        pass
     if agent == "miniswe":
         for pattern in ("preds.json", "minisweagent.log", "exit_statuses_*.yaml"):
             for path in base.glob(pattern):
@@ -472,7 +495,7 @@ def run_miniswe(task: Dict[str, Any], output_dir: Path, timeout: int = 1800) -> 
         "Multi": "multi-swe-bench",
     }
     subset = subset_map.get(bench, "verified")
-    out_subdir = output_dir / "miniswe" / bench
+    out_subdir = (output_dir / "miniswe" / bench).resolve()
     out_subdir.mkdir(parents=True, exist_ok=True)
 
     # Select MiniSWE config by bench:
@@ -591,6 +614,48 @@ def run_sweagent(task: Dict[str, Any], output_dir: Path, timeout: int = 1800) ->
         result = _run_subprocess(cmd, cwd=str(run_dir), env=env, timeout=timeout, debug=_DEBUG)
         if result.returncode == 0:
             return True, f"traj in {out_subdir}"
+        return False, result.stderr or result.stdout or f"exit {result.returncode}"
+    except subprocess.TimeoutExpired:
+        return False, f"Timeout after {timeout}s"
+    except Exception as e:
+        return False, str(e)
+
+
+def run_prometheus(task: Dict[str, Any], output_dir: Path, timeout: int = 3600) -> Tuple[bool, str]:
+    """Run Prometheus via agent-frameworks/prometheus/run_bench.py (HTTP API to Prometheus service)."""
+    run_script = AGENT_FRAMEWORKS / "prometheus" / "run_bench.py"
+    if not run_script.exists():
+        return False, f"Agent script not found: {run_script}"
+    bench = task.get("bench", "Verified")
+    instance_id = task.get("instance_id") or task.get("original_inst_id", "")
+    orig_id = task.get("original_inst_id") or instance_id
+    lookup_id = orig_id if orig_id else instance_id
+    cwd = AGENT_FRAMEWORKS / "prometheus"
+    out_traj = output_dir / "prometheus" / bench
+    out_traj.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        sys.executable,
+        str(run_script),
+        bench,
+        "--instance",
+        lookup_id,
+        "--limit",
+        "1",
+        "--output",
+        str(out_traj.parent),
+    ]
+    prometheus_url = os.environ.get("PROMETHEUS_URL")
+    if prometheus_url:
+        cmd.extend(["--prometheus-url", prometheus_url])
+    prom_timeout = os.environ.get("PROMETHEUS_TIMEOUT")
+    if prom_timeout:
+        cmd.extend(["--timeout", prom_timeout])
+    elif timeout != 3600:
+        cmd.extend(["--timeout", str(max(timeout, 3600))])
+    try:
+        result = _run_subprocess(cmd, cwd=str(cwd), timeout=max(timeout, 3600), debug=_DEBUG)
+        if result.returncode == 0:
+            return True, f"traj in {out_traj}"
         return False, result.stderr or result.stdout or f"exit {result.returncode}"
     except subprocess.TimeoutExpired:
         return False, f"Timeout after {timeout}s"
@@ -728,6 +793,12 @@ AGENT_RUNNERS: Dict[str, Dict[str, Any]] = {
         "Poly": run_openhands,
         "Multi": run_openhands,
     },
+    "prometheus": {
+        "Verified": run_prometheus,
+        "Pro": run_prometheus,
+        "Poly": run_prometheus,
+        "Multi": run_prometheus,
+    },
 }
 
 
@@ -849,6 +920,12 @@ def main() -> int:
         default=None,
         help="OpenHands agent class (or set OPENHANDS_AGENT)",
     )
+    ap.add_argument(
+        "--prometheus-url",
+        type=str,
+        default=None,
+        help="Prometheus API base URL (or set PROMETHEUS_URL)",
+    )
     args = ap.parse_args()
     global _DEBUG
     _DEBUG = bool(args.debug)
@@ -908,6 +985,8 @@ def main() -> int:
         os.environ["OPENHANDS_MODEL_CONFIG"] = args.openhands_model_config
     if args.openhands_agent:
         os.environ["OPENHANDS_AGENT"] = args.openhands_agent
+    if args.prometheus_url:
+        os.environ["PROMETHEUS_URL"] = args.prometheus_url
     # Read LLM settings from environment and propagate common aliases
     llm_url = os.environ.get("LLM_API_URL")
     llm_key = os.environ.get("LLM_API_KEY")

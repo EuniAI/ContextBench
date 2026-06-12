@@ -1,0 +1,89 @@
+import inspect
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.routing import APIRoute
+
+from prometheus.app import dependencies
+from prometheus.app.api.main import api_router
+from prometheus.app.exception_handler import register_exception_handlers
+from prometheus.app.middlewares.jwt_middleware import JWTMiddleware
+from prometheus.app.register_login_required_routes import (
+    login_required_routes,
+    register_login_required_routes,
+)
+from prometheus.configuration.config import settings
+from prometheus.utils.logger_manager import get_logger
+
+# Create main thread logger with file handler - ONE LINE!
+logger = get_logger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Initialization on startup
+    app.state.service = dependencies.initialize_services()
+    logger.info("Starting services...")
+    for service in app.state.service.values():
+        # Start each service, handling both async and sync start methods
+        if inspect.iscoroutinefunction(service.start):
+            await service.start()
+        else:
+            service.start()
+    # Initialization Completed
+    yield
+    # Cleanup on shutdown
+    logger.info("Shutting down services...")
+    for service in app.state.service.values():
+        # Close each service, handling both async and sync close methods
+        if inspect.iscoroutinefunction(service.close):
+            await service.close()
+        else:
+            service.close()
+
+
+def custom_generate_unique_id(route: APIRoute) -> str:
+    """
+    Custom function to generate unique IDs for API routes based on their tags and names.
+    """
+    return f"{route.tags[0]}-{route.name}"
+
+
+app = FastAPI(
+    lifespan=lifespan,
+    title=settings.PROJECT_NAME,  # Title on generated documentation
+    openapi_url=f"{settings.BASE_URL}/openapi.json",  # Path to generated OpenAPI documentation
+    generate_unique_id_function=custom_generate_unique_id,  # Custom function for generating unique route IDs
+    version=settings.version,  # Version of the API
+    debug=True if settings.ENVIRONMENT == "local" else False,
+)
+
+# Register middlewares
+if settings.ENABLE_AUTHENTICATION:
+    app.add_middleware(
+        JWTMiddleware,
+        login_required_routes=login_required_routes,
+    )
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.BACKEND_CORS_ORIGINS,  # Configure appropriately for production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Include the API router with a prefix
+app.include_router(api_router, prefix=settings.BASE_URL)
+
+# Register the exception handlers
+register_exception_handlers(app)
+# Register the login-required routes
+register_login_required_routes(app)
+
+
+@app.get("/health", tags=["health"])
+def health_check():
+    return {"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat()}

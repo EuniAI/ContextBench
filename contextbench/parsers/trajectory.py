@@ -146,6 +146,14 @@ def load_traj_file(traj_file: str) -> dict:
             pass
     elif basename.endswith('.log'):
         instance_id = basename.replace('.log', '')
+        json_sidecar = os.path.join(os.path.dirname(traj_file), f"{instance_id}.json")
+        if os.path.isfile(json_sidecar):
+            try:
+                with open(json_sidecar, encoding="utf-8") as jf:
+                    side = json.load(jf)
+                model_patch = side.get("edit_patch") or side.get("model_patch") or ""
+            except Exception:
+                pass
     else:
         instance_id = basename
     

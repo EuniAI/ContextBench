@@ -108,7 +108,7 @@ def _collect_paths_by_agent(root: Path, agent: str, recursive: bool) -> List[Pat
         for p in prom_root.rglob("*.log") if recursive else prom_root.glob("*.log"):
             if p.is_file():
                 out.append(p)
-        for bench in ("verified", "pro", "poly", "multi"):
+        for bench in ("verified", "pro", "poly", "multi", "Verified", "Pro", "Poly", "Multi"):
             sub = prom_root / bench
             if sub.is_dir():
                 for p in sub.glob("*.log"):

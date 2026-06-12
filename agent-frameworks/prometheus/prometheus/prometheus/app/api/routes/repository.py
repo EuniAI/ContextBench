@@ -1,0 +1,222 @@
+from typing import Sequence
+
+import git
+from fastapi import APIRouter, Request
+
+from prometheus.app.decorators.require_login import requireLogin
+from prometheus.app.models.requests.repository import (
+    CreateBranchAndPushRequest,
+    UploadRepositoryRequest,
+)
+from prometheus.app.models.response.repository import RepositoryResponse
+from prometheus.app.models.response.response import Response
+from prometheus.app.services.knowledge_graph_service import KnowledgeGraphService
+from prometheus.app.services.repository_service import RepositoryService
+from prometheus.app.services.user_service import UserService
+from prometheus.configuration.config import settings
+from prometheus.exceptions.memory_exception import MemoryException
+from prometheus.exceptions.server_exception import ServerException
+from prometheus.utils.github_utils import is_repository_public
+from prometheus.utils.memory_utils import delete_repository_memory
+
+router = APIRouter()
+
+
+async def get_github_token(request: Request, github_token: str | None = None) -> str | None:
+    """Retrieve GitHub token from the request or user profile.
+
+    Returns:
+        str | None: GitHub token if available, None for public repositories
+    """
+    # If the token is provided in the request, use it directly
+    if github_token:
+        return github_token
+
+    # If the user is authenticated, get the user service and fetch the token
+    if settings.ENABLE_AUTHENTICATION:
+        user_service: UserService = request.app.state.service["user_service"]
+        user = await user_service.get_user_by_id(request.state.user_id)
+        github_token = user.github_token if user else None
+    return github_token
+
+
+@router.post(
+    "/upload/",
+    description="""
+    Upload a GitHub repository to Prometheus, default to the latest commit in the main branch.
+    """,
+    response_model=Response,
+)
+@requireLogin
+async def upload_github_repository(
+    upload_repository_request: UploadRepositoryRequest, request: Request
+):
+    # Get the repository and knowledge graph services
+    repository_service: RepositoryService = request.app.state.service["repository_service"]
+    knowledge_graph_service: KnowledgeGraphService = request.app.state.service[
+        "knowledge_graph_service"
+    ]
+
+    # Check if the repository already exists
+    if settings.ENABLE_AUTHENTICATION:
+        repository = await repository_service.get_repository_by_url_commit_id_and_user_id(
+            upload_repository_request.https_url,
+            upload_repository_request.commit_id,
+            request.state.user_id,
+        )
+
+        # If the repository already exists, return its ID
+        if repository:
+            return Response(
+                message="Repository already exists", data={"repository_id": repository.id}
+            )
+
+    # Check if the number of repositories exceeds the limit
+    if settings.ENABLE_AUTHENTICATION:
+        user_repositories = await repository_service.get_repositories_by_user_id(
+            request.state.user_id
+        )
+        if len(user_repositories) >= settings.DEFAULT_USER_REPOSITORY_LIMIT:
+            raise ServerException(
+                code=400,
+                message=f"You have reached the maximum number of repositories ({settings.DEFAULT_USER_REPOSITORY_LIMIT}). Please delete some repositories before uploading new ones.",
+            )
+
+    # Get the GitHub token (may be None for public repositories)
+    github_token = await get_github_token(request, upload_repository_request.github_token)
+
+    # Check if the repository is public or private
+    is_repository_public_ = await is_repository_public(upload_repository_request.https_url)
+    if not is_repository_public_ and not github_token:
+        raise ServerException(
+            code=400,
+            message="This appears to be a private repository. Please provide a GitHub token.",
+        )
+
+    # Clone the repository
+    try:
+        saved_path = await repository_service.clone_github_repo(
+            github_token, upload_repository_request.https_url, upload_repository_request.commit_id
+        )
+    except git.exc.GitCommandError:
+        raise ServerException(
+            code=400, message=f"Unable to clone {upload_repository_request.https_url}"
+        )
+
+    # Build and save the knowledge graph from the cloned repository
+    root_node_id = await knowledge_graph_service.build_and_save_knowledge_graph(saved_path)
+    repository_id = await repository_service.create_new_repository(
+        url=upload_repository_request.https_url,
+        commit_id=upload_repository_request.commit_id,
+        playground_path=str(saved_path),
+        user_id=request.state.user_id if settings.ENABLE_AUTHENTICATION else None,
+        kg_root_node_id=root_node_id,
+    )
+    return Response(data={"repository_id": repository_id})
+
+
+@router.post(
+    "/create-branch-and-push/",
+    description="""
+    Create a new branch in the repository, commit changes, and push to remote.
+    """,
+    response_model=Response,
+)
+@requireLogin
+async def create_branch_and_push(
+    create_branch_and_push_request: CreateBranchAndPushRequest, request: Request
+):
+    # Get the repository service
+    repository_service: RepositoryService = request.app.state.service["repository_service"]
+
+    # Get the repository by ID
+    repository = await repository_service.get_repository_by_id(
+        create_branch_and_push_request.repository_id
+    )
+    if not repository:
+        raise ServerException(code=404, message="Repository not found")
+    # Check if the user has permission to modify the repository
+    if settings.ENABLE_AUTHENTICATION and repository.user_id != request.state.user_id:
+        raise ServerException(
+            code=403, message="You do not have permission to modify this repository"
+        )
+
+    # Get the Git Repository
+    git_repo = repository_service.get_repository(repository.playground_path)
+    try:
+        await git_repo.create_and_push_branch(
+            branch_name=create_branch_and_push_request.branch_name,
+            commit_message=create_branch_and_push_request.commit_message,
+            patch=create_branch_and_push_request.patch,
+        )
+    except git.exc.GitCommandError:
+        raise ServerException(code=400, message="Failed to create branch and push changes")
+    return Response()
+
+
+@router.get(
+    "/list/",
+    description="""
+    List all repositories uploaded to Prometheus by the authenticated user.
+    """,
+    response_model=Response[Sequence[RepositoryResponse]],
+)
+@requireLogin
+async def list_repositories(request: Request):
+    repository_service: RepositoryService = request.app.state.service["repository_service"]
+    if settings.ENABLE_AUTHENTICATION:
+        repositories = await repository_service.get_repositories_by_user_id(request.state.user_id)
+    else:
+        repositories = await repository_service.get_all_repositories()
+    return Response(data=[RepositoryResponse.model_validate(repo) for repo in repositories])
+
+
+@router.delete(
+    "/delete/",
+    description="""
+    Delete the repository uploaded to Prometheus, along with other information.
+    """,
+    response_model=Response,
+)
+@requireLogin
+async def delete(
+    repository_id: int,
+    request: Request,
+    force: bool = False,
+):
+    knowledge_graph_service: KnowledgeGraphService = request.app.state.service[
+        "knowledge_graph_service"
+    ]
+    repository_service: RepositoryService = request.app.state.service["repository_service"]
+
+    # Get the repository by ID
+    repository = await repository_service.get_repository_by_id(repository_id)
+
+    # Check if the repository exists
+    if not repository:
+        raise ServerException(code=404, message="Repository not found")
+
+    # Check if the user has permission to delete the repository
+    if settings.ENABLE_AUTHENTICATION and repository.user_id != request.state.user_id:
+        raise ServerException(
+            code=403, message="You do not have permission to delete this repository"
+        )
+
+    # Check if the repository is being processed
+    if repository.is_working and not force:
+        raise ServerException(
+            code=400, message="Repository is currently being processed, please try again later"
+        )
+    # Clear the knowledge graph and repository data
+    await knowledge_graph_service.clear_kg(repository.kg_root_node_id)
+    repository_service.clean_repository(repository)
+
+    # Remove semantic memory associated with the repository
+    try:
+        delete_repository_memory(repository.id)
+    except MemoryException:
+        pass
+
+    # Delete the repository from the database
+    await repository_service.delete_repository(repository)
+    return Response()

@@ -1,0 +1,11 @@
+@program Start
+
+use library console_output
+
+start {
+    declare text message = "Hello world!";
+    print_to_console(message);
+    halt;
+}
+
+end @program

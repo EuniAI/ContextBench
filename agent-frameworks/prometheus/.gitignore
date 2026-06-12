@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+results/
+smoke_results/
+
+# Vendored Prometheus runtime (see prometheus/.gitignore)
+prometheus/.env
+prometheus/working_dir/
+prometheus/data_neo4j/
+prometheus/data_postgres/
