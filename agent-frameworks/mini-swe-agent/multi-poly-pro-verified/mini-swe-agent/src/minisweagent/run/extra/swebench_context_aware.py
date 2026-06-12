@@ -912,33 +912,36 @@ def process_instance(
     """Process a single SWEBench instance."""
     instance_id = instance["instance_id"]
     instance_dir = output_dir / instance_id
+    exit_status: str = "Unknown"
+    result: str = ""
+    extra_info: Optional[dict] = None
+    docker_config: dict = {}
+    agent = None
+    env = None
+    model = None
+
     remove_from_preds_file(output_dir / "preds.json", instance_id)
     (instance_dir / f"{instance_id}.traj.json").unlink(missing_ok=True)
-    model = get_model(config=config.get("model", {}))
-    task = instance["problem_statement"]
-
     progress_manager.on_instance_start(instance_id)
-    progress_manager.update_instance_status(instance_id, "Configuring Docker")
-
-    # Get Docker configuration - use provided benchmark_type if available
-    docker_config = DockerConfigExtractor.get_docker_config_for_instance(
-        instance, poly_data_dir, auto_pull, benchmark_type=benchmark_type
-    )
-    logger.info(f"Docker config for {instance_id}: {docker_config['source']}")
-    
-    # Save Dockerfile for debugging if needed
-    if docker_config.get("dockerfile_content"):
-        instance_dir.mkdir(parents=True, exist_ok=True)
-        dockerfile_path = instance_dir / "Dockerfile.extracted"
-        dockerfile_path.write_text(docker_config["dockerfile_content"])
-
-    progress_manager.update_instance_status(instance_id, "Starting environment")
-
-    agent = None
-    extra_info = None
-    env = None
 
     try:
+        model = get_model(config=config.get("model", {}))
+        task = instance["problem_statement"]
+
+        progress_manager.update_instance_status(instance_id, "Configuring Docker")
+
+        docker_config = DockerConfigExtractor.get_docker_config_for_instance(
+            instance, poly_data_dir, auto_pull, benchmark_type=benchmark_type
+        )
+        logger.info(f"Docker config for {instance_id}: {docker_config['source']}")
+
+        if docker_config.get("dockerfile_content"):
+            instance_dir.mkdir(parents=True, exist_ok=True)
+            dockerfile_path = instance_dir / "Dockerfile.extracted"
+            dockerfile_path.write_text(docker_config["dockerfile_content"])
+
+        progress_manager.update_instance_status(instance_id, "Starting environment")
+
         env = get_sb_environment_with_docker_config(config, instance, docker_config)
         agent = ProgressTrackingContextAwareAgent(
             model,
@@ -950,7 +953,8 @@ def process_instance(
         exit_status, result = agent.run(task)
     except Exception as e:
         logger.error(f"Error processing instance {instance_id}: {e}", exc_info=True)
-        exit_status, result = type(e).__name__, str(e)
+        exit_status = type(e).__name__
+        result = str(e)
         extra_info = {"traceback": traceback.format_exc()}
     finally:
         # Include docker configuration in extra_info for debugging
@@ -969,7 +973,7 @@ def process_instance(
         )
         if agent:
             logger.info(f"Context data for {instance_id}: {agent.get_context_data()}")
-        update_preds_file(output_dir / "preds.json", instance_id, model.config.model_name, result)
+        update_preds_file(output_dir / "preds.json", instance_id, (model.config.model_name if model else "unknown"), result)
         progress_manager.on_instance_end(instance_id, exit_status)
         # Cleanup Docker environment
         if env is not None:
@@ -980,65 +984,92 @@ def process_instance(
 
 
 def _load_multiswe_dataset_safely(dataset_path: str, split: str) -> list[dict]:
-    """Safely load Multi-SWE-bench dataset with error handling for complex nested structures."""
-    max_retries = 3
-    
-    for attempt in range(max_retries):
+    """Load Multi-SWE-bench by directly downloading and parsing JSONL shard files.
+
+    ByteDance-Seed/Multi-SWE-bench consists of 40+ per-language JSONL files whose
+    schemas are incompatible (e.g. ``skipped_tests`` may be ``List(null)`` in one
+    shard but contain actual values in another).  The Hugging Face ``datasets``
+    library forces a single PyArrow schema across all shards, causing cast failures.
+    This function bypasses that layer entirely.
+    """
+    import json
+    from pathlib import Path
+
+    # ── Step 1: discover JSONL shard filenames from the builder ──────────────
+    try:
+        from datasets import load_dataset_builder
+        builder = load_dataset_builder(dataset_path)
+        data_files: list[str] = list(builder.config.data_files.get(split, []))
+    except Exception as e:
+        logger.warning(f"Could not probe builder config: {e}. Falling back to listing repo files.")
+        data_files = []
+
+    # Fallback: use hf_hub API to list files (if builder probing failed)
+    if not data_files:
         try:
-            logger.info(f"Loading Multi-SWE-bench dataset (attempt {attempt + 1}/{max_retries})...")
-            
-            # Try to load dataset with streaming to reduce memory pressure
-            try:
-                # First try with streaming=True to avoid memory issues
-                dataset = load_dataset(dataset_path, split=split, streaming=True)
-                instances = []
-                
-                # Process instances one by one to handle complex structures
-                for idx, instance in enumerate(dataset):
-                    try:
-                        # Simplify complex nested structures that cause PyArrow issues
-                        simplified_instance = _simplify_multiswe_instance(instance)
-                        instances.append(simplified_instance)
-                        
-                        # Log progress for large datasets
-                        if (idx + 1) % 100 == 0:
-                            logger.info(f"Processed {idx + 1} instances...")
-                            
-                    except Exception as inst_error:
-                        logger.warning(f"Skipping problematic instance {idx}: {inst_error}")
-                        continue
-                
-                logger.info(f"Successfully loaded {len(instances)} Multi-SWE-bench instances via streaming")
-                return instances
-                
-            except Exception as streaming_error:
-                logger.warning(f"Streaming load failed: {streaming_error}")
-                
-                # Fallback: try regular loading with post-processing
-                logger.info("Attempting regular dataset loading with post-processing...")
-                dataset = load_dataset(dataset_path, split=split)
-                
-                # Convert to list and simplify structures
-                instances = []
-                for instance in dataset:
-                    try:
-                        simplified_instance = _simplify_multiswe_instance(instance)
-                        instances.append(simplified_instance)
-                    except Exception as inst_error:
-                        logger.warning(f"Skipping problematic instance: {inst_error}")
-                        continue
-                
-                logger.info(f"Successfully loaded {len(instances)} Multi-SWE-bench instances via regular loading")
-                return instances
-                
+            from huggingface_hub import list_repo_files
+            raw_files = list_repo_files(dataset_path, repo_type="dataset")
+            data_files = [
+                f for f in raw_files
+                if f.endswith(".jsonl") and "/" in f and f.split("/")[0] != ".gitattributes"
+            ]
         except Exception as e:
-            logger.warning(f"Dataset loading attempt {attempt + 1} failed: {e}")
-            if attempt < max_retries - 1:
-                logger.info(f"Retrying in 5 seconds...")
-                time.sleep(5)
-            else:
-                logger.error(f"Failed to load Multi-SWE-bench dataset after {max_retries} attempts")
-                raise RuntimeError(f"Cannot load dataset {dataset_path}: {e}")
+            raise RuntimeError(f"Cannot enumerate {dataset_path} data files: {e}")
+
+    if not data_files:
+        raise RuntimeError(f"No JSONL data files found for split '{split}' in {dataset_path}")
+
+    # ── Step 2: download & parse every shard ────────────────────────────────
+    #   hf:// URL format:  hf://datasets/ByteDance-Seed/Multi-SWE-bench@<rev>/<path>
+    from huggingface_hub import hf_hub_download
+
+    total_loaded = 0
+    total_files = len(data_files)
+    instances: list[dict] = []
+
+    logger.info(f"Loading Multi-SWE-bench dataset ({total_files} JSONL shards, split={split})...")
+
+    for df_idx, data_file in enumerate(data_files, 1):
+        # extract the relative path inside the repo
+        if data_file.startswith("hf://") and "@" in data_file:
+            # hf://datasets/.../Multi-SWE-bench@<rev>/path/to/file.jsonl → path/to/file.jsonl
+            relative_path = data_file.split("@", 1)[1].split("/", 1)[1]
+        else:
+            relative_path = data_file  # already a plain relative path
+
+        try:
+            local_path = hf_hub_download(
+                repo_id=dataset_path,
+                filename=relative_path,
+                repo_type="dataset",
+            )
+        except Exception as e:
+            logger.warning(f"[{df_idx}/{total_files}] Failed to download {relative_path}: {e}")
+            continue
+
+        shard_count = 0
+        with open(local_path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    raw = json.loads(line)
+                    simplified = _simplify_multiswe_instance(raw)
+                    instances.append(simplified)
+                    shard_count += 1
+                except Exception as inst_error:
+                    logger.debug(f"Skipping instance in {relative_path}: {inst_error}")
+                    continue
+
+        total_loaded += shard_count
+        logger.info(f"[{df_idx}/{total_files}] {shard_count:4d} instances from {Path(relative_path).name}")
+
+    if not instances:
+        raise RuntimeError(f"Failed to load any instances from {dataset_path} (tried {total_files} shards)")
+
+    logger.info(f"Successfully loaded {len(instances)} Multi-SWE-bench instances via direct JSONL parsing")
+    return instances
 
 
 def _simplify_multiswe_instance(instance: dict) -> dict:
